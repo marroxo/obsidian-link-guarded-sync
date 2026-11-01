@@ -9,8 +9,10 @@
   max-height: var(--link-visible-height, calc(100dvh - 16px));
 }
 .link-conflict-modal .modal-content { box-sizing: border-box; display: flex; flex-direction: column; height: 100%; min-height: 0; margin: 0; overflow: hidden; }
+.link-conflict-modal .link-conflict-header { flex: 0 0 auto; padding: max(4px, env(safe-area-inset-top)) 4px 8px; background: var(--background-primary); }
+.link-conflict-modal .link-conflict-header h2 { margin: 0 0 8px; overflow-wrap: anywhere; }
+.link-conflict-modal .link-conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.link-conflict-modal .link-conflict-actions button { min-height: 44px; }
 .link-conflict-modal .link-conflict-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 4px 12px; }
 .link-conflict-modal .link-conflict-body pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .link-conflict-modal .link-conflict-textarea { width: 100%; min-height: 160px; font-size: 16px; }
-.link-conflict-modal .link-conflict-footer { flex: 0 0 auto; display: flex; gap: 8px; justify-content: flex-end; padding: 8px 4px max(8px, env(safe-area-inset-bottom)); background: var(--background-primary); }
-.link-conflict-modal .link-conflict-footer button { min-height: 44px; }
