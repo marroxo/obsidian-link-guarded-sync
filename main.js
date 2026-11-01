@@ -52,7 +52,7 @@ class LinkSync extends Plugin {
  async ensureLocalParents(path){let p='';for(const part of path.split('/').slice(0,-1)){p=p?p+'/'+part:part;if(!(await this.app.vault.adapter.exists(p)))await this.app.vault.adapter.mkdir(p);}}
  async resolve(item,choice,mergedText){
   if(this.busy)throw Error('Already running');
-  if(!this.data.conflicts.includes(item)||!this.safe(item.path))throw Error('Conflict is no longer current');
+  const matches=this.data.conflicts.filter(c=>c.path===item.path);if(matches.length!==1||!this.safe(item.path))throw Error('Conflict changed; sync and review it again');const current=matches[0];if(current.base!==item.base||current.local!==item.local||current.remote!==item.remote)throw Error('Conflict changed; sync and review it again');
   if(item.local==null||item.remote==null)throw Error('Deletion conflicts require separate review');
   if(baseline(this.data.base,item.path)!==(item.base??null))throw Error('Baseline changed; sync again');
   this.busy=true;this.expectedWrites?.clear();this.authContext={username:this.data.username,password:this.data.password};
@@ -81,7 +81,7 @@ class LinkSync extends Plugin {
    const after=await this.call('GET',path);if(after.status!==200||await hash(after.arrayBuffer)!==await hash(chosen)||await hash(await this.app.vault.adapter.readBinary(path))!==await hash(chosen))throw Error('Outcome changed or uncertain; sync again');
    strongValidator(after.headers,await hash(chosen));
    const previousBase=baseline(this.data.base,path), previousConflicts=this.data.conflicts;
-   archiveConflicts(this.data,[item]);setbase(this.data.base,path,await hash(chosen));this.data.conflicts=previousConflicts.filter(c=>c!==item);
+   archiveConflicts(this.data,[current]);setbase(this.data.base,path,await hash(chosen));this.data.conflicts=previousConflicts.filter(c=>c!==current);
    try{await this.saveData(this.data);}catch(e){if(previousBase===null)delete this.data.base[path];else setbase(this.data.base,path,previousBase);this.data.conflicts=previousConflicts;throw e;}
    new Notice('Link conflict applied');
   }finally{this.finishSync();}
@@ -145,7 +145,7 @@ class ConflictHistory extends Modal{
  onClose(){this.contentEl.empty();}
 }
 class ConflictView extends Modal{
- constructor(app,item,plugin){super(app);this.item=item;this.plugin=plugin;}
+ constructor(app,item,plugin){super(app);this.item={...item};this.plugin=plugin;}
  onOpen(){const el=this.contentEl;el.createEl('h2',{text:this.item.path});for(const side of ['local','remote']){el.createEl('h3',{text:side});const value=this.item[side];let text='Unavailable';if(value!=null){try{text=new TextDecoder('utf-8',{fatal:true}).decode(from64(value));}catch{text='Binary content; inspect the saved copy on this device.';}}const pre=el.createEl('pre');pre.textContent=text;}
   if(this.item.local==null||this.item.remote==null){el.createEl('p',{text:'Deletion conflicts require separate review; both sides are preserved.'});return;}
   const apply=(choice,text)=>this.plugin.resolve(this.item,choice,text).then(()=>this.close()).catch(e=>new Notice('Link: '+e.message));
