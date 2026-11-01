@@ -1,7 +1,7 @@
 {
   "id": "link-guarded-sync",
   "name": "Link Guarded Sync",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "minAppVersion": "1.12.3",
   "description": "Guarded note sync and offline workspace downloads.",
   "author": "Link",
