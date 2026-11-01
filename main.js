@@ -22,7 +22,7 @@ const CHUNK_SIZE = 1024 * 1024;
 
 function createChunkCache({adapter, request, crypto, root = CACHE_ROOT}) {
   if (root !== CACHE_ROOT) throw Error('Invalid cache root');
-  const active = new Set();
+  const active = new Set(), created = new Map();
   const enc = new TextEncoder();
   const hex = bytes => Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
   const digest = async bytes => hex(await crypto.subtle.digest('SHA-256', bytes));
@@ -94,6 +94,7 @@ function createChunkCache({adapter, request, crypto, root = CACHE_ROOT}) {
         if (await adapter.exists(receiptPath)) throw Error('Cache receipt appeared; preserved for review');
         await adapter.writeBinary(receiptPath, enc.encode(JSON.stringify(receipt)).buffer);
         if (!await verifyCached(sha, size, index)) throw Error('Cache receipt unavailable');
+        created.set(`${sha}:${index}`, JSON.stringify(receipt));
         if (progress) progress(index + 1, count);
       }
       return {asset: sha, size, chunks: count};
@@ -111,7 +112,34 @@ function createChunkCache({adapter, request, crypto, root = CACHE_ROOT}) {
       await consumer(data, index);
     }
   }
-  return {download, forEachVerifiedChunk};
+  // Only a newly owned, single-chunk cache is eligible. A crash between
+  // removals leaves an untracked orphan, which is deliberately retained.
+  async function cleanupFresh(sha, size, destination, generation, completed) {
+    if (!/^[0-9a-f]{64}$/.test(sha) || !Number.isSafeInteger(size) || size<0 || size>CHUNK_SIZE || active.has(sha)) throw Error('Invalid cleanup identity');
+    const owned=created.get(`${sha}:0`);
+    if (!owned) return;
+    const receiptPath=path(receiptName(sha,0));
+    if (!await adapter.exists(receiptPath)) throw Error('Cache receipt missing');
+    const bytes=await adapter.readBinary(receiptPath);
+    if (bytes.byteLength>4096) throw Error('Invalid cache receipt; preserved for review');
+    const r=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+    validateReceipt(r,sha,size,0);
+    if (JSON.stringify(r)!==owned) throw Error('Cache receipt changed');
+    if (!await verifyCached(sha,size,0)) throw Error('Cached chunk missing');
+    const current=await adapter.readBinary(receiptPath);
+    if (await digest(current)!==await digest(bytes)) throw Error('Cache receipt changed');
+    if(typeof destination!=='string'||!destination.startsWith('Workspace/')||! /^[a-f0-9]{64}$/.test(generation)||!completed||completed.path!==destination||completed.sha!==sha||completed.size!==size||completed.status!=='complete') throw Error('Invalid cleanup claim');
+    const claimPath=path(`cleanup-${sha}-${random()}.json`),claim={kind:'cleanup',sha,size,destination,generation,receipt:r,completed};
+    if(await adapter.exists(claimPath))throw Error('Cleanup claim collision');
+    const encoded=enc.encode(JSON.stringify(claim));await adapter.writeBinary(claimPath,encoded.buffer);
+    const savedClaim=await adapter.readBinary(claimPath);
+    if(await digest(savedClaim)!==await digest(encoded.buffer))throw Error('Cleanup claim uncertain');
+    await adapter.remove(receiptPath);
+    await adapter.remove(path(r.file));
+    await adapter.remove(claimPath);
+    created.delete(`${sha}:0`);
+  }
+  return {download, forEachVerifiedChunk, cleanupFresh};
 }
 
 if (typeof module !== 'undefined') module.exports = {createChunkCache, CACHE_ROOT, CHUNK_SIZE};
@@ -767,7 +795,7 @@ __linkModules['./workspace-import'] = (() => { const module={exports:{}}; const 
 const {verifyVaultRoot}=require('./root-health');
 const {createChunkCache, CACHE_ROOT} = require('./mobile-chunks');
 const {incrementalSha256} = require('./mobile-assembly');
-const {createReceiptStore} = require('./asset-receipts');
+const {createReceiptStore, ROOT: RECEIPT_ROOT} = require('./asset-receipts');
 const {createCatalogCheckpoint} = require('./catalog-checkpoint');
 const ROOT = 'Workspace';
 const API = 'https://link.andric.studio/library';
@@ -794,6 +822,7 @@ function workspacePath(rel) {
   if (typeof rel !== 'string' || !rel.startsWith(ROOT + '/') || !rel.split('/').every(validPart)) throw Error('Unsafe catalog path');
   return rel;
 }
+const isDeviceRuntime=path=>path.toLowerCase().startsWith('workspace/files/tools/link-remarkable/.render-venv/');
 
 class WorkspaceImporter {
   constructor({vault, requestUrl, data, save, crypto, progress, diagnostic}) {
@@ -886,8 +915,21 @@ class WorkspaceImporter {
       const latest=await this.probe();
       if(signal?.aborted)throw Error('Transfer paused');
       if(!force && this.data.workspaceGeneration===latest && this.data.workspaceCatalogReceipt){
-        const reviewPaths=this.data.workspaceReviewPaths||[],reviewReasons=this.data.workspaceReviewReasons||{};
-        return {installed:0,updated:0,review:reviewPaths.length,reviewPaths,reviewReasons,previouslyDownloaded:0,total:0,unchanged:true};
+        const priorPaths=this.data.workspaceReviewPaths||[],priorReasons=this.data.workspaceReviewReasons||{};
+        const legacyRuntime=priorPaths.filter(p=>priorReasons[p]==='Hidden folder needs review'&&isDeviceRuntime(p));
+        const legacyHidden=priorPaths.filter(p=>priorReasons[p]==='Hidden folder needs review'&&!isDeviceRuntime(p));
+        const legacyLarge=priorPaths.filter(p=>priorReasons[p]==='Large file deferred for review');
+        const legacyExcluded=priorPaths.filter(p=>priorReasons[p]==='Excluded .trash');
+        const oldHeld=new Set([...legacyHidden,...legacyRuntime,...legacyLarge,...legacyExcluded]);
+        const reviewPaths=priorPaths.filter(p=>!oldHeld.has(p));
+        const reviewReasons=Object.fromEntries(reviewPaths.map(p=>[p,priorReasons[p]]));
+        const hiddenHeld=this.data.workspaceHiddenHeld??legacyHidden.length,runtimeHeld=this.data.workspaceRuntimeHeld??legacyRuntime.length,largeHeld=this.data.workspaceLargeHeld??legacyLarge.length,excluded=this.data.workspaceExcluded??legacyExcluded.length;
+        if(legacyHidden.length||legacyRuntime.length||legacyLarge.length||legacyExcluded.length){
+          const old={paths:this.data.workspaceReviewPaths,reasons:this.data.workspaceReviewReasons,held:this.data.workspaceHiddenHeld,runtime:this.data.workspaceRuntimeHeld,large:this.data.workspaceLargeHeld,excluded:this.data.workspaceExcluded};
+          this.data.workspaceReviewPaths=reviewPaths;this.data.workspaceReviewReasons=reviewReasons;this.data.workspaceHiddenHeld=hiddenHeld;this.data.workspaceRuntimeHeld=runtimeHeld;this.data.workspaceLargeHeld=largeHeld;this.data.workspaceExcluded=excluded;
+          try{await this.save();}catch(e){this.data.workspaceReviewPaths=old.paths;this.data.workspaceReviewReasons=old.reasons;this.data.workspaceHiddenHeld=old.held;this.data.workspaceRuntimeHeld=old.runtime;this.data.workspaceLargeHeld=old.large;this.data.workspaceExcluded=old.excluded;throw e;}
+        }
+        return {installed:0,updated:0,review:reviewPaths.length,reviewPaths,reviewReasons,hiddenHeld,runtimeHeld,largeHeld,excluded,previouslyDownloaded:0,total:0,unchanged:true};
       }
       const {generation,entries:assets}=await this.catalog(signal), adapter=this.vault.adapter;
       if(generation!==latest)throw new WorkspaceGenerationAdvanced();
@@ -899,8 +941,43 @@ class WorkspaceImporter {
       const cache=createChunkCache({adapter,crypto:this.crypto,request:async (sha,index)=>this.fetch(`/api/workspace-assets/${sha}/chunks/${index}?generation=${generation}`)});
       const legacy=this.data.workspaceReceipts||{};
       if (typeof legacy !== 'object' || Array.isArray(legacy)) throw Error('Invalid workspace receipts');
+      // One preflight per import: never reclaim an existing cache or a journal-referenced SHA.
+      let cacheListing;try{cacheListing=await adapter.list(CACHE_ROOT);}catch{cacheListing=null;}
+      let cleanupSafe=!!cacheListing && Array.isArray(cacheListing.files)&&Array.isArray(cacheListing.folders)&&!cacheListing.folders.length;
+      if(cleanupSafe && cacheListing.files.some(p=>typeof p!=='string'||!p.startsWith(CACHE_ROOT+'/')||p.slice(CACHE_ROOT.length+1).includes('/')))cleanupSafe=false;
+      const initialSha=new Set();
+      if(cleanupSafe)for(const path of cacheListing.files){
+        const match=path.slice(CACHE_ROOT.length+1).match(/^(?:cleanup-)?([a-f0-9]{64})-/);
+        if(match)initialSha.add(match[1]);
+      }
+      const shaCounts=new Map();for(const a of assets)shaCounts.set(a.sha,(shaCounts.get(a.sha)||0)+1);
+      const blockedSha=new Set();
+      if(cleanupSafe && await adapter.exists(RECEIPT_ROOT)){
+        try{
+          const dirs=await adapter.list(RECEIPT_ROOT);
+          if(!Array.isArray(dirs.files)||dirs.files.length||!Array.isArray(dirs.folders)||dirs.folders.length>20000)throw Error('Invalid receipt root');
+          let scanned=0;for(const dir of dirs.folders){
+            if(scanned++%25===0)await new Promise(resolve=>setTimeout(resolve,0));
+            if(signal?.aborted)throw Error('Transfer paused');
+            if(!new RegExp(`^${RECEIPT_ROOT.replaceAll('.','\\.')}\/[a-f0-9]{64}$`).test(dir))throw Error('Invalid receipt folder');
+            const listing=await adapter.list(dir);if(!Array.isArray(listing.files)||!Array.isArray(listing.folders)||listing.folders.length||listing.files.length>3000)throw Error('Invalid receipt folder');
+            for(const file of listing.files){
+              const m=file.slice(dir.length+1).match(/^(receipt|journal|done)-(\d{12})-([a-f0-9]{32})\.json$/);
+              if(!file.startsWith(dir+'/')||!m)throw Error('Invalid private receipt name');
+              if(m[1]!=='journal')continue;
+              const st=await adapter.stat(file);if(!st||st.size>4096)throw Error('Invalid journal');
+              const j=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await adapter.readBinary(file)));
+              const digest=await this.crypto.subtle.digest('SHA-256',new TextEncoder().encode(j.path));
+              const folder=Array.from(new Uint8Array(digest),x=>x.toString(16).padStart(2,'0')).join('');
+              if(j.kind!=='journal'||typeof j.path!=='string'||j.id!==m[3]||j.revision!==Number(m[2])||!dir.endsWith('/'+folder))throw Error('Invalid journal');
+              if(!Object.hasOwn(j,'oldSha')||!Object.hasOwn(j,'newSha'))throw Error('Invalid journal identity');
+              for(const sha of [j.oldSha,j.newSha]){if(sha!==null && sha!==undefined){if(!/^[a-f0-9]{64}$/.test(sha))throw Error('Invalid journal SHA');blockedSha.add(sha);}}
+            }
+          }
+        }catch(e){if(signal?.aborted)throw e;cleanupSafe=false;}
+      }
       const store=createReceiptStore({adapter,crypto:this.crypto});
-      let installed=0,updated=0,removed=0,review=0,previouslyDownloaded=0,reviewPaths=[],reviewReasons={},pendingMissing=[],caseBlocked=new Set(),deletionPlans=[],batchOps=0;
+      let installed=0,updated=0,removed=0,review=0,hiddenHeld=0,runtimeHeld=0,largeHeld=0,excluded=0,previouslyDownloaded=0,reviewPaths=[],reviewReasons={},pendingMissing=[],caseBlocked=new Set(),deletionPlans=[],batchOps=0;
       const flag=(path,reason)=>{review++;reviewPaths.push(path);reviewReasons[path]=reason;};
       // Absence has meaning only when both catalog generations are complete.
       if(previous){
@@ -949,11 +1026,11 @@ class WorkspaceImporter {
         if(caseBlocked.has(a.path.toLowerCase()))continue;
         // Hidden folders are not accessible through the exclusive Vault API.
         if (a.path.split('/').some(part=>part.startsWith('.'))) {
-          flag(a.path,a.path.split('/').some(part=>part.toLowerCase()==='.trash')?'Excluded .trash':'Hidden folder needs review');
+          if(a.path.split('/').some(part=>part.toLowerCase()==='.trash'))excluded++;else if(isDeviceRuntime(a.path))runtimeHeld++;else hiddenHeld++;
           continue;
         }
         let state;try{state=await store.load(a.path);}catch{flag(a.path,'Private receipt needs review');continue;}
-        if(state.pending){flag(a.path,'Interrupted update retained; review required');continue;}
+        if(state.pending){cleanupSafe=false;flag(a.path,'Interrupted update retained; review required');continue;}
         const receipt=state.receipt||legacy[a.path],exists=await adapter.exists(a.path);
         if(exists){
           if(!await this.matches(a.path,receipt)){flag(a.path,'Local file changed or is untracked');continue;}
@@ -968,7 +1045,7 @@ class WorkspaceImporter {
           }
           if(receipt.size>MAX_SMALL)this.progress?.({index:i+1,total:assets.length,path:a.path,installed,review,status:'Large file checked by metadata; local contents not rehashed'});
         }else if(receipt&&receipt.status!=='removed'){flag(a.path,'Previously downloaded file is missing');continue;}
-        if(a.size>MAX_RUN_FILE){flag(a.path,'Large file deferred for review');continue;}
+        if(a.size>MAX_RUN_FILE){largeHeld++;continue;}
         if(batchOps>=MAX_RUN_TRANSFERS){await this.waitForNextBatch(signal,generation,i+1,assets.length);batchOps=0;}
         batchOps++;
         await this.diagnostic?.({path:a.path,phase:'download',bytes:0,total:a.size});
@@ -1005,20 +1082,26 @@ class WorkspaceImporter {
         const finalStat=await adapter.stat(a.path);
         await store.writeReceipt(a.path,state,{sha:a.sha,size:a.size,status:'complete',mtime:finalStat?.mtime,ctime:finalStat?.ctime});
         await store.finish(a.path,state.dir,journal);
+        if(cleanupSafe && !exists && a.size<=MAX_SMALL && shaCounts.get(a.sha)===1 && !blockedSha.has(a.sha) && !initialSha.has(a.sha)){
+          const saved=await store.load(a.path);
+          if(saved.pending || !saved.receipt || saved.receipt.sha!==a.sha || saved.receipt.size!==a.size || !await this.matches(a.path,saved.receipt)) throw Error('Cleanup verification uncertain');
+          await cache.cleanupFresh(a.sha,a.size,a.path,generation,saved.receipt);
+        }
         if(exists)updated++;else installed++;this.completedOps++;
       }
       if(signal?.aborted)throw Error('Transfer paused');
       if(await this.probe()!==generation)throw new WorkspaceGenerationAdvanced();
       if(signal?.aborted)throw Error('Transfer paused');
       const newCheckpoint=await checkpoint.save(generation,assets,pendingMissing);
-      const before={generation:this.data.workspaceGeneration,checkpoint:this.data.workspaceCatalogReceipt,paths:this.data.workspaceReviewPaths,reasons:this.data.workspaceReviewReasons};
+      const before={generation:this.data.workspaceGeneration,checkpoint:this.data.workspaceCatalogReceipt,paths:this.data.workspaceReviewPaths,reasons:this.data.workspaceReviewReasons,held:this.data.workspaceHiddenHeld,runtime:this.data.workspaceRuntimeHeld,large:this.data.workspaceLargeHeld,excluded:this.data.workspaceExcluded};
       this.data.workspaceGeneration=generation;this.data.workspaceCatalogReceipt=newCheckpoint;this.data.workspaceReviewPaths=reviewPaths;this.data.workspaceReviewReasons=reviewReasons;
-      try{await this.save();}catch(e){this.data.workspaceGeneration=before.generation;this.data.workspaceCatalogReceipt=before.checkpoint;this.data.workspaceReviewPaths=before.paths;this.data.workspaceReviewReasons=before.reasons;throw e;}
-      return {installed,updated,removed,review,reviewPaths,reviewReasons,previouslyDownloaded,total:assets.length,unchanged:false};
+      this.data.workspaceHiddenHeld=hiddenHeld;this.data.workspaceRuntimeHeld=runtimeHeld;this.data.workspaceLargeHeld=largeHeld;this.data.workspaceExcluded=excluded;
+      try{await this.save();}catch(e){this.data.workspaceGeneration=before.generation;this.data.workspaceCatalogReceipt=before.checkpoint;this.data.workspaceReviewPaths=before.paths;this.data.workspaceReviewReasons=before.reasons;this.data.workspaceHiddenHeld=before.held;this.data.workspaceRuntimeHeld=before.runtime;this.data.workspaceLargeHeld=before.large;this.data.workspaceExcluded=before.excluded;throw e;}
+      return {installed,updated,removed,review,reviewPaths,reviewReasons,hiddenHeld,runtimeHeld,largeHeld,excluded,previouslyDownloaded,total:assets.length,unchanged:false};
     } finally {this.running=false;}
   }
 }
-module.exports={WorkspaceImporter,workspacePath};
+module.exports={WorkspaceImporter,workspacePath,isDeviceRuntime};
 
 return module.exports; })();
 __linkModules['./plugin_pairing'] = (() => { const module={exports:{}}; const require = id => {if(Object.prototype.hasOwnProperty.call(__linkModules,id))return __linkModules[id];throw Error('Unknown bundled module');};
@@ -1074,7 +1157,7 @@ return module.exports; })();
 { const require = id => {if(Object.prototype.hasOwnProperty.call(__linkModules,id))return __linkModules[id];if(id==='obsidian')return __linkNativeRequire(id);throw Error('Unknown module');};
 const {verifyVaultRoot}=require('./root-health');
 const {Plugin,PluginSettingTab,Setting,Notice,Modal,requestUrl}=require('obsidian');
-const {WorkspaceImporter}=require('./workspace-import');
+const {WorkspaceImporter,isDeviceRuntime}=require('./workspace-import');
 const {workspacePairing,createPairTransport}=require('./plugin_pairing');
 const ENDPOINTS={production:'https://obsidian.markojelly.lol/link/Link/',test:'https://obsidian.markojelly.lol/link-mobile-test/Link/'};
 const encoder=new TextEncoder();
@@ -1102,7 +1185,7 @@ function setbase(base,path,value){Object.defineProperty(base,path,{value,writabl
 function archiveConflicts(data,items){const archive=data.conflictArchive||[],keyOf=c=>JSON.stringify([c.path,c.base,c.reason,c.local,c.remote]),known=new Set(archive.map(keyOf));for(const c of items){const key=keyOf(c);if(!known.has(key)){archive.push({...c,archivedAt:new Date().toISOString()});known.add(key);}}data.conflictArchive=archive;}
 class LinkSync extends Plugin {
  safe(path){const config=(this.app.vault.configDir||'.obsidian').toLowerCase();return valid(path)&&!isTrash(path)&&!((this.data.workspaceReserved||this.data.migration)&&(path.toLowerCase()==='workspace'||path.toLowerCase().startsWith('workspace/')))&&!path.split('/').some(x=>x.toLowerCase()===config);}
- async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());await this.recoverMigrationActivation();if(!this.data.workspaceCrashGuardReady||this.data.workspaceRunActive){if(this.data.workspaceRunActive||this.data.workspacePending||this.data.workspaceAutoEnabled){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;this.data.workspaceRecoveryRequired=true;}this.data.workspaceCrashGuardReady=true;await this.saveData(this.data);}this.busy=false;this.pendingSync=false;this.active=true;this.expectedWrites=new Map();this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});this.register(()=>{this.active=false;this.pendingSync=false;this.workspaceAbort?.abort();clearTimeout(this.syncTimer);});const resume=()=>{if(document.visibilityState!=='visible'){this.workspaceAbort?.abort();return;}if(this.active&&!migrationBlocked(this.data)){if(this.data.workspacePending||this.data.workspaceAutoEnabled){this.workspaceForegroundDue=true;this.pendingSync=true;this.resumePendingWorkspace();}else this.autoSync();}};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);const changed=file=>{this.onVaultChange(file).catch(()=>{if(this.active&&document.visibilityState==='visible')this.scheduleSync();});};this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));this.registerEvent(this.app.vault.on('delete',changed));this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{if(this.safe(oldPath))changed({path:oldPath});changed(file);}));}
+ async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());await this.recoverMigrationActivation();if(!this.data.workspaceCrashGuardReady||this.data.workspaceRunActive){if(this.data.workspaceRunActive||this.data.workspacePending||this.data.workspaceAutoEnabled){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;this.data.workspaceRecoveryRequired=true;}this.data.workspaceCrashGuardReady=true;await this.saveData(this.data);}this.workspaceReviewReasons=this.data.workspaceReviewReasons||{};this.workspaceReviewPaths=(Array.isArray(this.data.workspaceReviewPaths)?this.data.workspaceReviewPaths:[]).filter(p=>!['Hidden folder needs review','Excluded .trash','Large file deferred for review'].includes(this.workspaceReviewReasons[p]));this.busy=false;this.pendingSync=false;this.active=true;this.expectedWrites=new Map();this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});this.register(()=>{this.active=false;this.pendingSync=false;this.workspaceAbort?.abort();clearTimeout(this.syncTimer);});const resume=()=>{if(document.visibilityState!=='visible'){this.workspaceAbort?.abort();return;}if(this.active&&!migrationBlocked(this.data)){if(this.data.workspacePending||this.data.workspaceAutoEnabled){this.workspaceForegroundDue=true;this.pendingSync=true;this.resumePendingWorkspace();}else this.autoSync();}};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);const changed=file=>{this.onVaultChange(file).catch(()=>{if(this.active&&document.visibilityState==='visible')this.scheduleSync();});};this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));this.registerEvent(this.app.vault.on('delete',changed));this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{if(this.safe(oldPath))changed({path:oldPath});changed(file);}));}
  async onVaultChange(file){if(this.migrationActivating&&file?.path&&this.safe(file.path))this.migrationActivating.add(file.path);if(!this.active||document.visibilityState!=='visible'||!file?.path||!this.safe(file.path))return;const path=file.path,expected=this.expectedWrites.get(path);if(expected){let actual;try{actual=await hash(await this.app.vault.adapter.readBinary(path));}catch{}if(!this.active||document.visibilityState!=='visible')return;if(this.expectedWrites.get(path)===expected){if(actual===expected.digest)return;this.expectedWrites.delete(path);}}this.scheduleSync();}
  markOwnWrite(path,digest){this.expectedWrites??=new Map();this.expectedWrites.set(path,{digest});}
  scheduleSync(){if(migrationBlocked(this.data)||!this.data.username||!this.data.password)return;clearTimeout(this.syncTimer);if(this.busy||this.workspacePairBusy||this.workspaceStarting||this.workspaceTask){this.pendingSync=true;return;}this.syncTimer=setTimeout(()=>{this.syncTimer=null;if(document.visibilityState==='visible')this.autoSync();},2000);}
@@ -1243,7 +1326,8 @@ class LinkSync extends Plugin {
     this.workspaceReviewPaths=result.reviewPaths;
     this.workspaceReviewReasons=result.reviewReasons||{};
     if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
-    this.workspaceReport(result.unchanged?`Workspace checked; ${result.review} need review`:`Last pass: ${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
+    const held=`${result.runtimeHeld||0} desktop renderer runtime files not imported, ${result.hiddenHeld||0} other hidden source files held (not imported), ${result.largeHeld||0} large files deferred (not imported), ${result.excluded||0} excluded`;
+    this.workspaceReport(result.unchanged?`Workspace checked; ${result.review} need review; ${held}`:`Last pass: ${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review; ${held}`);
    }catch(e){
     interrupted=runStarted&&!!this.workspaceAbort?.signal.aborted;
     if(!interrupted){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;try{await this.saveData(this.data);}catch{}this.workspaceReport(e.message);}
@@ -1460,7 +1544,11 @@ class LinkSettings extends PluginSettingTab{
   this.plugin.workspaceStatusListener=message=>{if(workspaceStatus.isConnected)workspaceStatus.textContent='Workspace: '+message;};
   if(this.plugin.workspaceStatus)workspaceStatus.textContent='Workspace: '+this.plugin.workspaceStatus;
   else if(this.plugin.data.workspaceRecoveryRequired)workspaceStatus.textContent='Workspace: paused after an interrupted session. Review before resuming.';
-  if(this.plugin.data.workspaceRecoveryRequired&&this.plugin.data.workspaceDiagnostic){const d=this.plugin.data.workspaceDiagnostic;el.createEl('p',{text:`Last transfer: ${d.path} · ${d.phase} · ${d.bytes}/${d.total} bytes`});}
+  const oldHidden=(this.plugin.data.workspaceReviewPaths||[]).filter(p=>this.plugin.data.workspaceReviewReasons?.[p]==='Hidden folder needs review');
+  const held=this.plugin.data.workspaceHiddenHeld??oldHidden.filter(p=>!isDeviceRuntime(p)).length,runtime=this.plugin.data.workspaceRuntimeHeld??oldHidden.filter(isDeviceRuntime).length;
+  const large=this.plugin.data.workspaceLargeHeld??(this.plugin.data.workspaceReviewPaths||[]).filter(p=>this.plugin.data.workspaceReviewReasons?.[p]==='Large file deferred for review').length;
+  if(held||runtime||large)el.createEl('p',{text:`${runtime} desktop renderer runtime files, ${held} other hidden source files and ${large} large files are not imported. These are separate from conflicts requiring review.`});
+  if(this.plugin.data.workspaceRecoveryRequired&&this.plugin.data.workspaceDiagnostic){const d=this.plugin.data.workspaceDiagnostic;el.createEl('p',{text:`Last transfer: ${d.path} Ã‚Â· ${d.phase} Ã‚Â· ${d.bytes}/${d.total} bytes`});}
   new Setting(el).setName('Offline workspace').setDesc('Downloads workspace updates. Phone edits are not uploaded. Existing or partial files require review.').addButton(b=>b.setButtonText('Start / resume').onClick(()=>this.plugin.startWorkspace().catch(e=>this.plugin.workspaceReport(e.message)))).addButton(b=>b.setButtonText('Pause').onClick(()=>this.plugin.pauseWorkspace().catch(e=>this.plugin.workspaceReport('Pause could not be saved: '+e.message)))).addButton(b=>b.setButtonText('Review').onClick(()=>{const items=this.plugin.workspaceReviewPaths||[];if(!items.length)return new Notice('No files awaiting review');const index=(this.plugin.workspaceReviewIndex||0)%items.length;this.plugin.workspaceReviewIndex=index+1;const path=items[index];const reason=this.plugin.workspaceReviewReasons?.[path];if(reason)return new Notice(reason+': '+path);const f=this.app.vault.getFileByPath(path);if(f)this.app.workspace.getLeaf(false).openFile(f);else new Notice('File unavailable: '+path);}));
   el.createEl('p',{text:'Note sync runs after saved edits, on opening or returning to Obsidian, and manually. A new vault requires an empty first sync; existing test vaults can use migration. Conflicting edits require review. Note deletion propagation requires server support; retained versions are kept privately.'});
   for(const c of this.plugin.data.conflicts||[])new Setting(el).setName(c.path).setDesc(c.reason).addButton(b=>b.setButtonText('Review').onClick(()=>new ConflictView(this.app,c,this.plugin).open()));
