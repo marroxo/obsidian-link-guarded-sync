@@ -13,6 +13,8 @@ function plan(base,local,remote){
 }
 function to64(buf){const a=new Uint8Array(buf);let s='';for(let i=0;i<a.length;i+=32768)s+=String.fromCharCode(...a.subarray(i,i+32768));return btoa(s);}
 function from64(s){const raw=atob(s);return Uint8Array.from(raw,c=>c.charCodeAt(0)).buffer;}
+function etagHeader(headers){const values=Object.entries(headers||{}).filter(([key])=>key.toLowerCase()==='etag').map(([,value])=>value);return values.length&&values.every(v=>v===values[0])?values[0]:undefined;}
+function strongValidator(headers,digest){const tag=etagHeader(headers);if(typeof tag!=='string'||!tag)throw Error('Server validator missing or ambiguous');if(/^W\//i.test(tag))throw Error('Server validator is weak');if(tag!=='"sha256-'+digest+'"')throw Error('Server validator does not match downloaded content');return tag;}
 function baseline(base,path){return Object.prototype.hasOwnProperty.call(base,path)?base[path]:null;}
 function setbase(base,path,value){Object.defineProperty(base,path,{value,writable:true,enumerable:true,configurable:true});}
 function archiveConflicts(data,items){const archive=data.conflictArchive||[],keyOf=c=>JSON.stringify([c.path,c.base,c.reason,c.local,c.remote]),known=new Set(archive.map(keyOf));for(const c of items){const key=keyOf(c);if(!known.has(key)){archive.push({...c,archivedAt:new Date().toISOString()});known.add(key);}}data.conflictArchive=archive;}
@@ -55,7 +57,7 @@ class LinkSync extends Plugin {
    if(!(await this.app.vault.adapter.exists(path)))throw Error('Local file changed; sync again');
    if(await hash(await this.app.vault.adapter.readBinary(path))!==await hash(local))throw Error('Local file changed; sync again');
    const before=await this.call('GET',path);if(before.status!==200||await hash(before.arrayBuffer)!==await hash(remote))throw Error('Remote file changed; sync again');
-   const etag=before.headers.etag||before.headers.ETag;if(etag!=='"sha256-'+await hash(remote)+'"')throw Error('Strong validator missing');
+   const etag=strongValidator(before.headers,await hash(remote));
    let chosen;if(choice==='local')chosen=local;else if(choice==='remote')chosen=remote;else if(choice==='merged'&&typeof mergedText==='string')chosen=encoder.encode(mergedText).buffer;else throw Error('Invalid choice');
    if(chosen.byteLength>8*1024*1024)throw Error('Content exceeds limit');
    if(await hash(await this.app.vault.adapter.readBinary(path))!==await hash(local))throw Error('Local file changed; sync again');
@@ -73,7 +75,7 @@ class LinkSync extends Plugin {
    }
    if(file)await this.app.vault.process(file,current=>{if(current!==oldText)throw Error('Local file changed; sync again');return newText;});
    const after=await this.call('GET',path);if(after.status!==200||await hash(after.arrayBuffer)!==await hash(chosen)||await hash(await this.app.vault.adapter.readBinary(path))!==await hash(chosen))throw Error('Outcome changed or uncertain; sync again');
-   const finalTag=after.headers.etag||after.headers.ETag;if(finalTag!=='"sha256-'+await hash(chosen)+'"')throw Error('Resolution validator missing');
+   strongValidator(after.headers,await hash(chosen));
    const previousBase=baseline(this.data.base,path), previousConflicts=this.data.conflicts;
    archiveConflicts(this.data,[item]);setbase(this.data.base,path,await hash(chosen));this.data.conflicts=previousConflicts.filter(c=>c!==item);
    try{await this.saveData(this.data);}catch(e){if(previousBase===null)delete this.data.base[path];else setbase(this.data.base,path,previousBase);this.data.conflicts=previousConflicts;throw e;}
@@ -89,7 +91,7 @@ class LinkSync extends Plugin {
    for(const path of Array.from(all).sort()){
     if(!this.safe(path))throw Error('Unsafe path');let lb=null,rb=null,lh=null,rh=null,etag=null;
     if(local.has(path)){lb=await this.app.vault.adapter.readBinary(path);lh=await hash(lb);}
-    if(remote.has(path)){const r=await this.call('GET',path);if(r.status!==200)throw Error('Remote read '+r.status);rb=r.arrayBuffer;rh=await hash(rb);etag=r.headers.etag||r.headers.ETag;if(etag!=='"sha256-'+rh+'"')throw Error('Strong validator missing');}
+    if(remote.has(path)){const r=await this.call('GET',path);if(r.status!==200)throw Error('Remote read '+r.status);rb=r.arrayBuffer;rh=await hash(rb);etag=strongValidator(r.headers,rh);}
     const prior=baseline(this.data.base,path);let action=plan(prior,lh,rh);if(!this.data.initialized&&action==='upload')action='conflict';
     if(action==='equal'){if(lh===null)delete this.data.base[path];else setbase(this.data.base,path,lh);continue;}
     if(action==='download-new'){
@@ -151,4 +153,4 @@ class ConflictView extends Modal{
  }
  onClose(){this.contentEl.empty();}
 }
-module.exports=LinkSync;module.exports._test={valid,plan};
+module.exports=LinkSync;module.exports._test={valid,plan,strongValidator};
