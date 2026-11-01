@@ -775,6 +775,20 @@ const MAX_SMALL = 1024 * 1024;
 const MAX_RUN_FILE = 8 * 1024 * 1024;
 const MAX_RUN_TRANSFERS = 20;
 const BATCH_COOLDOWN_MS = 1000;
+const MAX_GENERATION_RETRIES = 3;
+class WorkspaceGenerationAdvanced extends Error {
+  constructor(){super('Workspace generation changed');this.name='WorkspaceGenerationAdvanced';}
+}
+async function cancellableDelay(ms,signal){
+  if(signal?.aborted)throw Error('Transfer paused');
+  await new Promise((resolve,reject)=>{
+    let timer;const aborted=()=>{clearTimeout(timer);signal?.removeEventListener('abort',aborted);reject(Error('Transfer paused'));};
+    timer=setTimeout(()=>{signal?.removeEventListener('abort',aborted);resolve();},ms);
+    signal?.addEventListener('abort',aborted,{once:true});
+    if(signal?.aborted)aborted();
+  });
+  if(signal?.aborted)throw Error('Transfer paused');
+}
 const validPart = x => !!x && x !== '.' && x !== '..' && !/[\\:<>\x00-\u001f"|?*]/.test(x) && !/[. ]$/.test(x) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(x);
 function workspacePath(rel) {
   if (typeof rel !== 'string' || !rel.startsWith(ROOT + '/') || !rel.split('/').every(validPart)) throw Error('Unsafe catalog path');
@@ -785,6 +799,7 @@ class WorkspaceImporter {
   constructor({vault, requestUrl, data, save, crypto, progress, diagnostic}) {
     Object.assign(this, {vault, requestUrl, data, save, crypto, progress, diagnostic});
     this.running = false;
+    this.completedOps = 0;
   }
   async fetch(route) {
     if (!route.startsWith('/api/workspace-assets/') || route.includes('..')) throw Error('Invalid route');
@@ -807,7 +822,8 @@ class WorkspaceImporter {
       if(signal?.aborted)throw Error('Transfer paused');
       if (r.status!==200) throw Error('Workspace catalog unavailable: '+r.status);
       let page; try {page=JSON.parse(r.text);} catch {throw Error('Invalid workspace catalog');}
-      if (!/^[a-f0-9]{64}$/.test(page.generation) || (generation && generation!==page.generation) ||
+      if(generation && /^[a-f0-9]{64}$/.test(page.generation) && generation!==page.generation)throw new WorkspaceGenerationAdvanced();
+      if (!/^[a-f0-9]{64}$/.test(page.generation) ||
           !Number.isSafeInteger(page.total) || page.total<0 || page.total>20000 || page.offset!==offset || typeof page.complete!=='boolean' || !Array.isArray(page.entries) || page.entries.length>100 ||
           (total!==null && page.total!==total)) throw Error('Invalid workspace catalog');
       generation=page.generation; total=page.total;
@@ -840,15 +856,25 @@ class WorkspaceImporter {
   async waitForNextBatch(signal,generation,index,total){
     if(signal?.aborted)throw Error('Transfer paused');
     this.progress?.({index,total,status:'Waiting before next batch'});
-    await new Promise((resolve,reject)=>{
-      let timer;const aborted=()=>{clearTimeout(timer);signal?.removeEventListener('abort',aborted);reject(Error('Transfer paused'));};
-      timer=setTimeout(()=>{signal?.removeEventListener('abort',aborted);resolve();},BATCH_COOLDOWN_MS);
-      signal?.addEventListener('abort',aborted,{once:true});
-      if(signal?.aborted)aborted();
-    });
+    await cancellableDelay(BATCH_COOLDOWN_MS,signal);
     if(signal?.aborted)throw Error('Transfer paused');
-    if(await this.probe()!==generation)throw Error('Workspace generation changed; restart required');
+    if(await this.probe()!==generation)throw new WorkspaceGenerationAdvanced();
     if(signal?.aborted)throw Error('Transfer paused');
+  }
+  async runFollowingGeneration(signal,options={}){
+    let attempts=0,lastCompleted=this.completedOps,windowStart=Date.now(),repinned=false;
+    for(;;){
+      try{return await this.run(signal,{...options,force:!!options.force||repinned});}
+      catch(error){
+        if(!(error instanceof WorkspaceGenerationAdvanced))throw error;
+        const now=Date.now();
+        if(this.completedOps>lastCompleted || now-windowStart>=60000){attempts=0;windowStart=now;lastCompleted=this.completedOps;}
+        if(attempts>=MAX_GENERATION_RETRIES)throw error;
+        this.progress?.({index:0,total:0,status:'Workspace changed; checking again'});
+        await cancellableDelay(1000*(2**attempts),signal);
+        attempts++;repinned=true;
+      }
+    }
   }
   async run(signal,{force=false}={}) {
     if (this.running) throw Error('Workspace import already running');
@@ -864,6 +890,7 @@ class WorkspaceImporter {
         return {installed:0,updated:0,review:reviewPaths.length,reviewPaths,reviewReasons,previouslyDownloaded:0,total:0,unchanged:true};
       }
       const {generation,entries:assets}=await this.catalog(signal), adapter=this.vault.adapter;
+      if(generation!==latest)throw new WorkspaceGenerationAdvanced();
       await this.checkRoot();
       const checkpoint=createCatalogCheckpoint({adapter,crypto:this.crypto,validatePath:workspacePath});
       const previous=await checkpoint.load(this.data.workspaceCatalogReceipt);
@@ -911,7 +938,7 @@ class WorkspaceImporter {
           try{await adapter.rename(old.path,archive);}catch{pendingMissing.push(old);flag(old.path,'Deletion interrupted; original retained for review');continue;}
           if(await adapter.exists(old.path)||!await this.matches(archive,receipt)){pendingMissing.push(old);flag(old.path,'Retained file changed or path reappeared');continue;}
           await store.writeReceipt(old.path,state,{sha:receipt.sha,size:receipt.size,status:'removed',mtime:receipt.mtime,ctime:receipt.ctime,archive});
-          await store.finish(old.path,state.dir,journal);removed++;
+          await store.finish(old.path,state.dir,journal);removed++;this.completedOps++;
         }
       }
       for (let i=0;i<assets.length;i++) {
@@ -978,10 +1005,10 @@ class WorkspaceImporter {
         const finalStat=await adapter.stat(a.path);
         await store.writeReceipt(a.path,state,{sha:a.sha,size:a.size,status:'complete',mtime:finalStat?.mtime,ctime:finalStat?.ctime});
         await store.finish(a.path,state.dir,journal);
-        if(exists)updated++;else installed++;
+        if(exists)updated++;else installed++;this.completedOps++;
       }
       if(signal?.aborted)throw Error('Transfer paused');
-      if(await this.probe()!==generation)throw Error('Workspace generation changed; restart required');
+      if(await this.probe()!==generation)throw new WorkspaceGenerationAdvanced();
       if(signal?.aborted)throw Error('Transfer paused');
       const newCheckpoint=await checkpoint.save(generation,assets,pendingMissing);
       const before={generation:this.data.workspaceGeneration,checkpoint:this.data.workspaceCatalogReceipt,paths:this.data.workspaceReviewPaths,reasons:this.data.workspaceReviewReasons};
@@ -1161,7 +1188,7 @@ class LinkSync extends Plugin {
   if(this.workspaceAbort.signal.aborted||!this.active||document.visibilityState!=='visible')throw Error('Transfer paused');
   if(this.busy||this.workspacePairBusy||this.workspaceImporter?.running)throw Error('Sync is running');
   this.workspaceImporter=new WorkspaceImporter({vault:this.app.vault,requestUrl,data:this.data,save:()=>this.saveData(this.data),crypto,progress:onProgress,diagnostic:async value=>{this.data.workspaceDiagnostic={...value,path:value.path.slice(0,512)};await this.saveData(this.data);}});
-  const force=!!this.workspaceForceReview;this.workspaceForceReview=false;return this.workspaceImporter.run(this.workspaceAbort.signal,{force});
+  const force=!!this.workspaceForceReview;this.workspaceForceReview=false;return this.workspaceImporter.runFollowingGeneration(this.workspaceAbort.signal,{force});
  }
  workspaceReport(message){this.workspaceStatus=message;if(this.workspaceStatusListener)this.workspaceStatusListener(message);}
  workspacePairClient(){
@@ -1216,7 +1243,7 @@ class LinkSync extends Plugin {
     this.workspaceReviewPaths=result.reviewPaths;
     this.workspaceReviewReasons=result.reviewReasons||{};
     if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
-    this.workspaceReport(result.unchanged?`Workspace checked; ${result.review} need review`:`${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
+    this.workspaceReport(result.unchanged?`Workspace checked; ${result.review} need review`:`Last pass: ${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
    }catch(e){
     interrupted=runStarted&&!!this.workspaceAbort?.signal.aborted;
     if(!interrupted){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;try{await this.saveData(this.data);}catch{}this.workspaceReport(e.message);}
