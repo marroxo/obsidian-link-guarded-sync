@@ -59,7 +59,7 @@ function createChunkCache({adapter, request, crypto, root = CACHE_ROOT}) {
       throw Error('Cached chunk corrupt; preserved for review');
     return data;
   }
-  async function download(sha, size, signal, progress) {
+  async function download(sha, size, signal, progress, beforeChunk) {
     if (typeof sha !== 'string' || !/^[0-9a-f]{64}$/.test(sha) || !Number.isSafeInteger(size) || size < 0)
       throw Error('Invalid asset identity or size');
     if (active.has(sha)) throw Error('Asset download already active');
@@ -69,6 +69,8 @@ function createChunkCache({adapter, request, crypto, root = CACHE_ROOT}) {
       for (let index = 0; index < count; index++) {
         if (signal?.aborted) throw Error('Transfer paused');
         if (await verifyCached(sha, size, index)) continue;
+        if (beforeChunk) await beforeChunk(index * CHUNK_SIZE, size);
+        if (signal?.aborted) throw Error('Transfer paused');
         const result = await request(sha, index);
         if (signal?.aborted) throw Error('Transfer paused');
         if (!result || result.status !== 200 || !(result.arrayBuffer instanceof ArrayBuffer)) throw Error('Chunk request failed');
@@ -770,6 +772,8 @@ const {createCatalogCheckpoint} = require('./catalog-checkpoint');
 const ROOT = 'Workspace';
 const API = 'https://link.andric.studio/library';
 const MAX_SMALL = 1024 * 1024;
+const MAX_RUN_FILE = 8 * 1024 * 1024;
+const MAX_RUN_TRANSFERS = 20;
 const validPart = x => !!x && x !== '.' && x !== '..' && !/[\\:<>\x00-\u001f"|?*]/.test(x) && !/[. ]$/.test(x) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(x);
 function workspacePath(rel) {
   if (typeof rel !== 'string' || !rel.startsWith(ROOT + '/') || !rel.split('/').every(validPart)) throw Error('Unsafe catalog path');
@@ -777,8 +781,8 @@ function workspacePath(rel) {
 }
 
 class WorkspaceImporter {
-  constructor({vault, requestUrl, data, save, crypto, progress}) {
-    Object.assign(this, {vault, requestUrl, data, save, crypto, progress});
+  constructor({vault, requestUrl, data, save, crypto, progress, diagnostic}) {
+    Object.assign(this, {vault, requestUrl, data, save, crypto, progress, diagnostic});
     this.running = false;
   }
   async fetch(route) {
@@ -803,7 +807,7 @@ class WorkspaceImporter {
       if (r.status!==200) throw Error('Workspace catalog unavailable: '+r.status);
       let page; try {page=JSON.parse(r.text);} catch {throw Error('Invalid workspace catalog');}
       if (!/^[a-f0-9]{64}$/.test(page.generation) || (generation && generation!==page.generation) ||
-          !Number.isSafeInteger(page.total) || page.total<0 || page.total>100000 || page.offset!==offset || typeof page.complete!=='boolean' || !Array.isArray(page.entries) || page.entries.length>100 ||
+          !Number.isSafeInteger(page.total) || page.total<0 || page.total>20000 || page.offset!==offset || typeof page.complete!=='boolean' || !Array.isArray(page.entries) || page.entries.length>100 ||
           (total!==null && page.total!==total)) throw Error('Invalid workspace catalog');
       generation=page.generation; total=page.total;
       for (const item of page.entries) {
@@ -822,7 +826,7 @@ class WorkspaceImporter {
     const r=await this.fetch('/api/workspace-assets/catalog?offset=0&limit=1');
     if(r.status!==200)throw Error('Workspace catalog unavailable: '+r.status);
     let page;try{page=JSON.parse(r.text);}catch{throw Error('Invalid workspace catalog');}
-    if(!/^[a-f0-9]{64}$/.test(page.generation)||page.offset!==0||!Number.isSafeInteger(page.total)||page.total<0||page.total>100000||!Array.isArray(page.entries)||page.entries.length!==Math.min(page.total,1)||page.complete!==(page.total<=1)||(page.total>1&&page.next_offset!==1))throw Error('Invalid workspace catalog');
+    if(!/^[a-f0-9]{64}$/.test(page.generation)||page.offset!==0||!Number.isSafeInteger(page.total)||page.total<0||page.total>20000||!Array.isArray(page.entries)||page.entries.length!==Math.min(page.total,1)||page.complete!==(page.total<=1)||(page.total>1&&page.next_offset!==1))throw Error('Invalid workspace catalog');
     return page.generation;
   }
   async matches(path,receipt) {
@@ -861,7 +865,8 @@ class WorkspaceImporter {
       if(previous){
         const current=new Map(assets.map(a=>[a.path.toLowerCase(),a.path])),prior=new Map();
         for(const e of [...previous.entries,...previous.pending])prior.set(e.path.toLowerCase(),e);
-        for(const old of prior.values()){
+        let scanned=0;for(const old of prior.values()){
+          if(scanned++%25===0)await new Promise(resolve=>setTimeout(resolve,0));
           if(signal?.aborted)throw Error('Transfer paused');
           const present=current.get(old.path.toLowerCase());
           if(present===old.path)continue;
@@ -879,6 +884,8 @@ class WorkspaceImporter {
         }
         for(const {old,state,receipt} of deletionPlans){
           if(signal?.aborted)throw Error('Transfer paused');
+          if(removed>=MAX_RUN_TRANSFERS)return {installed,updated,removed,review,reviewPaths,reviewReasons,previouslyDownloaded,total:assets.length,batchPaused:true};
+          await this.diagnostic?.({path:old.path,phase:'retain',bytes:0,total:receipt.size});
           await this.checkRoot();
           const archive='.obsidian/plugins/link-guarded-sync/workspace-archive/'+store.random()+'/content';await this.parents(archive);
           if(await adapter.exists(archive))throw Error('Workspace archive collision');
@@ -893,6 +900,7 @@ class WorkspaceImporter {
         }
       }
       for (let i=0;i<assets.length;i++) {
+        if(i%25===0)await new Promise(resolve=>setTimeout(resolve,0));
         if (signal?.aborted) throw Error('Transfer paused');
         const a=assets[i];
         this.progress?.({index:i+1,total:assets.length,path:a.path,installed,review});
@@ -918,7 +926,11 @@ class WorkspaceImporter {
           }
           if(receipt.size>MAX_SMALL)this.progress?.({index:i+1,total:assets.length,path:a.path,installed,review,status:'Large file checked by metadata; local contents not rehashed'});
         }else if(receipt&&receipt.status!=='removed'){flag(a.path,'Previously downloaded file is missing');continue;}
-        await cache.download(a.sha,a.size,signal,(chunk,total)=>this.progress?.({index:i+1,total:assets.length,path:a.path,chunk,chunks:total,installed,review}));
+        if(a.size>MAX_RUN_FILE){flag(a.path,'Large file deferred for review');continue;}
+        if(installed+updated+removed>=MAX_RUN_TRANSFERS)return {installed,updated,removed,review,reviewPaths,reviewReasons,previouslyDownloaded,total:assets.length,batchPaused:true};
+        await this.diagnostic?.({path:a.path,phase:'download',bytes:0,total:a.size});
+        await cache.download(a.sha,a.size,signal,(chunk,total)=>this.progress?.({index:i+1,total:assets.length,path:a.path,chunk,chunks:total,installed,review}),async bytes=>{await this.diagnostic?.({path:a.path,phase:'download',bytes,total:a.size});});
+        await this.diagnostic?.({path:a.path,phase:'verify',bytes:a.size,total:a.size});
         let pre=incrementalSha256.create(), preSize=0;
         await cache.forEachVerifiedChunk(a.sha,a.size,async b=>{pre.update(new Uint8Array(b));preSize+=b.byteLength;},signal);
         if (preSize!==a.size || pre.hex()!==a.sha) throw Error('Workspace asset checksum mismatch');
@@ -926,6 +938,7 @@ class WorkspaceImporter {
         if (signal?.aborted) throw Error('Transfer paused');
         let archive=null;
         if(exists){archive='.obsidian/plugins/link-guarded-sync/workspace-archive/'+store.random()+'/content';await this.parents(archive);if(await adapter.exists(archive))throw Error('Workspace archive collision');}
+        await this.diagnostic?.({path:a.path,phase:'assemble',bytes:0,total:a.size});
         const journal=await store.begin(a.path,state,{action:exists?'update':'create',oldSha:receipt?.sha||null,newSha:a.sha,archive});
         if(exists){
           if(!await this.matches(a.path,receipt)){flag(a.path,'Local file changed before update');continue;}
@@ -938,6 +951,8 @@ class WorkspaceImporter {
         catch(e) {if (await adapter.exists(a.path)) {flag(a.path,'Destination appeared during update');continue;} throw e;}
         let actual=0, h=incrementalSha256.create();
         await cache.forEachVerifiedChunk(a.sha,a.size,async b=>{
+          if (signal?.aborted) throw Error('Transfer paused');
+          await this.diagnostic?.({path:a.path,phase:'assemble',bytes:actual,total:a.size});
           if (signal?.aborted) throw Error('Transfer paused');
           if (b.byteLength) await this.vault.appendBinary(file,b);
           h.update(new Uint8Array(b)); actual+=b.byteLength;
@@ -1041,7 +1056,7 @@ function setbase(base,path,value){Object.defineProperty(base,path,{value,writabl
 function archiveConflicts(data,items){const archive=data.conflictArchive||[],keyOf=c=>JSON.stringify([c.path,c.base,c.reason,c.local,c.remote]),known=new Set(archive.map(keyOf));for(const c of items){const key=keyOf(c);if(!known.has(key)){archive.push({...c,archivedAt:new Date().toISOString()});known.add(key);}}data.conflictArchive=archive;}
 class LinkSync extends Plugin {
  safe(path){const config=(this.app.vault.configDir||'.obsidian').toLowerCase();return valid(path)&&!isTrash(path)&&!((this.data.workspaceReserved||this.data.migration)&&(path.toLowerCase()==='workspace'||path.toLowerCase().startsWith('workspace/')))&&!path.split('/').some(x=>x.toLowerCase()===config);}
- async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());await this.recoverMigrationActivation();this.busy=false;this.pendingSync=false;this.active=true;this.expectedWrites=new Map();this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});this.register(()=>{this.active=false;this.pendingSync=false;this.workspaceAbort?.abort();clearTimeout(this.syncTimer);});const resume=()=>{if(document.visibilityState!=='visible'){this.workspaceAbort?.abort();return;}if(this.active&&!migrationBlocked(this.data)){if(this.data.workspacePending||this.data.workspaceAutoEnabled){this.workspaceForegroundDue=true;this.pendingSync=true;this.resumePendingWorkspace();}else this.autoSync();}};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);const changed=file=>{this.onVaultChange(file).catch(()=>{if(this.active&&document.visibilityState==='visible')this.scheduleSync();});};this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));this.registerEvent(this.app.vault.on('delete',changed));this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{if(this.safe(oldPath))changed({path:oldPath});changed(file);}));}
+ async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());await this.recoverMigrationActivation();if(!this.data.workspaceCrashGuardReady||this.data.workspaceRunActive){if(this.data.workspaceRunActive||this.data.workspacePending||this.data.workspaceAutoEnabled){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;this.data.workspaceRecoveryRequired=true;}this.data.workspaceCrashGuardReady=true;await this.saveData(this.data);}this.busy=false;this.pendingSync=false;this.active=true;this.expectedWrites=new Map();this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});this.register(()=>{this.active=false;this.pendingSync=false;this.workspaceAbort?.abort();clearTimeout(this.syncTimer);});const resume=()=>{if(document.visibilityState!=='visible'){this.workspaceAbort?.abort();return;}if(this.active&&!migrationBlocked(this.data)){if(this.data.workspacePending||this.data.workspaceAutoEnabled){this.workspaceForegroundDue=true;this.pendingSync=true;this.resumePendingWorkspace();}else this.autoSync();}};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);const changed=file=>{this.onVaultChange(file).catch(()=>{if(this.active&&document.visibilityState==='visible')this.scheduleSync();});};this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));this.registerEvent(this.app.vault.on('delete',changed));this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{if(this.safe(oldPath))changed({path:oldPath});changed(file);}));}
  async onVaultChange(file){if(this.migrationActivating&&file?.path&&this.safe(file.path))this.migrationActivating.add(file.path);if(!this.active||document.visibilityState!=='visible'||!file?.path||!this.safe(file.path))return;const path=file.path,expected=this.expectedWrites.get(path);if(expected){let actual;try{actual=await hash(await this.app.vault.adapter.readBinary(path));}catch{}if(!this.active||document.visibilityState!=='visible')return;if(this.expectedWrites.get(path)===expected){if(actual===expected.digest)return;this.expectedWrites.delete(path);}}this.scheduleSync();}
  markOwnWrite(path,digest){this.expectedWrites??=new Map();this.expectedWrites.set(path,{digest});}
  scheduleSync(){if(migrationBlocked(this.data)||!this.data.username||!this.data.password)return;clearTimeout(this.syncTimer);if(this.busy||this.workspacePairBusy||this.workspaceStarting||this.workspaceTask){this.pendingSync=true;return;}this.syncTimer=setTimeout(()=>{this.syncTimer=null;if(document.visibilityState==='visible')this.autoSync();},2000);}
@@ -1126,7 +1141,7 @@ class LinkSync extends Plugin {
   await this.enableWorkspace();
   if(this.workspaceAbort.signal.aborted||!this.active||document.visibilityState!=='visible')throw Error('Transfer paused');
   if(this.busy||this.workspacePairBusy||this.workspaceImporter?.running)throw Error('Sync is running');
-  this.workspaceImporter=new WorkspaceImporter({vault:this.app.vault,requestUrl,data:this.data,save:()=>this.saveData(this.data),crypto,progress:onProgress});
+  this.workspaceImporter=new WorkspaceImporter({vault:this.app.vault,requestUrl,data:this.data,save:()=>this.saveData(this.data),crypto,progress:onProgress,diagnostic:async value=>{this.data.workspaceDiagnostic={...value,path:value.path.slice(0,512)};await this.saveData(this.data);}});
   const force=!!this.workspaceForceReview;this.workspaceForceReview=false;return this.workspaceImporter.run(this.workspaceAbort.signal,{force});
  }
  workspaceReport(message){this.workspaceStatus=message;if(this.workspaceStatusListener)this.workspaceStatusListener(message);}
@@ -1155,8 +1170,8 @@ class LinkSync extends Plugin {
   try{
    await this.enableWorkspace();
    if((this.workspaceIntentSerial||0)!==intent)return;
-   const oldPending=this.data.workspacePending,oldEnabled=this.data.workspaceAutoEnabled;this.data.workspacePending=true;this.data.workspaceAutoEnabled=true;
-   try{await this.saveData(this.data);}catch(e){this.data.workspacePending=oldPending;this.data.workspaceAutoEnabled=oldEnabled;throw e;}
+   const oldPending=this.data.workspacePending,oldEnabled=this.data.workspaceAutoEnabled,oldRecovery=this.data.workspaceRecoveryRequired,oldActive=this.data.workspaceRunActive;this.data.workspacePending=true;this.data.workspaceAutoEnabled=true;this.data.workspaceRecoveryRequired=false;this.data.workspaceRunActive=false;
+   try{await this.saveData(this.data);}catch(e){this.data.workspacePending=oldPending;this.data.workspaceAutoEnabled=oldEnabled;this.data.workspaceRecoveryRequired=oldRecovery;this.data.workspaceRunActive=oldActive;throw e;}
    this.workspaceForceReview=true;
   }finally{this.workspaceStarting=false;}
   return this.resumePendingWorkspace();
@@ -1174,18 +1189,22 @@ class LinkSync extends Plugin {
   if(!this.active||document.visibilityState!=='visible'||!(this.data.workspacePending||this.data.workspaceAutoEnabled)||!this.data.initialized||!this.data.workspaceReserved||!/^wsd_[a-f0-9]{32}\.[a-f0-9]{64}$/.test(this.data.workspaceToken||'')||this.busy||this.workspacePairBusy||this.workspaceStarting||this.workspaceTask)return;
   this.workspaceForegroundDue=false;
   this.workspaceTask=(async()=>{
-   let interrupted=false;
+   let interrupted=false,runStarted=false;
    try{
-    const result=await this.importWorkspace(p=>this.workspaceReport(`${p.index}/${p.total} ${p.status||''}`));
+    this.data.workspaceRunActive=true;await this.saveData(this.data);
+    if(!this.active||document.visibilityState!=='visible'||!(this.data.workspacePending||this.data.workspaceAutoEnabled)){interrupted=true;return;}
+    this.workspaceAbort=null;runStarted=true;const result=await this.importWorkspace(p=>this.workspaceReport(`${p.index}/${p.total} ${p.status||''}`));
     this.workspaceReviewPaths=result.reviewPaths;
     this.workspaceReviewReasons=result.reviewReasons||{};
-    if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
-    this.workspaceReport(result.unchanged?`Up to date; ${result.review} need review`:`${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
+    if(result.batchPaused){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;await this.saveData(this.data);}
+    else if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
+    this.workspaceReport(result.batchPaused?`Paused after ${result.installed+result.updated} transfers; resume for next batch`:result.unchanged?`Up to date; ${result.review} need review`:`${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
    }catch(e){
-    interrupted=!!this.workspaceAbort?.signal.aborted;
+    interrupted=runStarted&&!!this.workspaceAbort?.signal.aborted;
     if(!interrupted){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;try{await this.saveData(this.data);}catch{}this.workspaceReport(e.message);}
     else this.workspaceReport('Paused');
    }finally{
+    this.data.workspaceRunActive=false;try{await this.saveData(this.data);}catch{this.data.workspaceRunActive=true;this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;this.workspaceReport('Paused: unable to save recovery state');}
     this.workspaceTask=null;
     if(interrupted&&(this.data.workspacePending||this.data.workspaceAutoEnabled)&&this.active&&document.visibilityState==='visible')this.resumePendingWorkspace();
     else if(!this.data.workspacePending&&this.pendingSync){this.pendingSync=false;this.scheduleSync();}
@@ -1395,6 +1414,8 @@ class LinkSettings extends PluginSettingTab{
   const workspaceStatus=el.createEl('p',{text:'Workspace: ready'});
   this.plugin.workspaceStatusListener=message=>{if(workspaceStatus.isConnected)workspaceStatus.textContent='Workspace: '+message;};
   if(this.plugin.workspaceStatus)workspaceStatus.textContent='Workspace: '+this.plugin.workspaceStatus;
+  else if(this.plugin.data.workspaceRecoveryRequired)workspaceStatus.textContent='Workspace: paused after an interrupted session. Review before resuming.';
+  if(this.plugin.data.workspaceRecoveryRequired&&this.plugin.data.workspaceDiagnostic){const d=this.plugin.data.workspaceDiagnostic;el.createEl('p',{text:`Last transfer: ${d.path} · ${d.phase} · ${d.bytes}/${d.total} bytes`});}
   new Setting(el).setName('Offline workspace').setDesc('Downloads workspace updates. Phone edits are not uploaded. Existing or partial files require review.').addButton(b=>b.setButtonText('Start / resume').onClick(()=>this.plugin.startWorkspace().catch(e=>this.plugin.workspaceReport(e.message)))).addButton(b=>b.setButtonText('Pause').onClick(()=>this.plugin.pauseWorkspace().catch(e=>this.plugin.workspaceReport('Pause could not be saved: '+e.message)))).addButton(b=>b.setButtonText('Review').onClick(()=>{const items=this.plugin.workspaceReviewPaths||[];if(!items.length)return new Notice('No files awaiting review');const index=(this.plugin.workspaceReviewIndex||0)%items.length;this.plugin.workspaceReviewIndex=index+1;const path=items[index];const reason=this.plugin.workspaceReviewReasons?.[path];if(reason)return new Notice(reason+': '+path);const f=this.app.vault.getFileByPath(path);if(f)this.app.workspace.getLeaf(false).openFile(f);else new Notice('File unavailable: '+path);}));
   el.createEl('p',{text:'Note sync runs after saved edits, on opening or returning to Obsidian, and manually. A new vault requires an empty first sync; existing test vaults can use migration. Conflicting edits require review. Note deletion propagation requires server support; retained versions are kept privately.'});
   for(const c of this.plugin.data.conflicts||[])new Setting(el).setName(c.path).setDesc(c.reason).addButton(b=>b.setButtonText('Review').onClick(()=>new ConflictView(this.app,c,this.plugin).open()));
