@@ -20,15 +20,19 @@ function setbase(base,path,value){Object.defineProperty(base,path,{value,writabl
 function archiveConflicts(data,items){const archive=data.conflictArchive||[],keyOf=c=>JSON.stringify([c.path,c.base,c.reason,c.local,c.remote]),known=new Set(archive.map(keyOf));for(const c of items){const key=keyOf(c);if(!known.has(key)){archive.push({...c,archivedAt:new Date().toISOString()});known.add(key);}}data.conflictArchive=archive;}
 class LinkSync extends Plugin {
  safe(path){const config=(this.app.vault.configDir||'.obsidian').toLowerCase();return valid(path)&&!path.split('/').some(x=>x.toLowerCase()===config);}
- async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());this.busy=false;this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});let active=true;this.register(()=>{active=false;});const resume=()=>{if(active&&document.visibilityState==='visible')this.autoSync();};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);}
- autoSync(){if(this.busy||!this.data.username||!this.data.password)return;this.sync().catch(e=>new Notice('Link sync failed: '+e.message));}
+ async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());this.busy=false;this.pendingSync=false;this.active=true;this.expectedWrites=new Map();this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});this.register(()=>{this.active=false;this.pendingSync=false;clearTimeout(this.syncTimer);});const resume=()=>{if(this.active&&document.visibilityState==='visible')this.autoSync();};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);const changed=file=>{this.onVaultChange(file).catch(()=>{if(this.active&&document.visibilityState==='visible')this.scheduleSync();});};this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));}
+ async onVaultChange(file){if(!this.active||document.visibilityState!=='visible'||!file?.path||!this.safe(file.path))return;const path=file.path,expected=this.expectedWrites.get(path);if(expected){let actual;try{actual=await hash(await this.app.vault.adapter.readBinary(path));}catch{}if(!this.active||document.visibilityState!=='visible')return;if(this.expectedWrites.get(path)===expected){if(actual===expected.digest)return;this.expectedWrites.delete(path);}}this.scheduleSync();}
+ markOwnWrite(path,digest){this.expectedWrites??=new Map();this.expectedWrites.set(path,{digest});}
+ scheduleSync(){if(!this.data.username||!this.data.password)return;clearTimeout(this.syncTimer);if(this.busy){this.pendingSync=true;return;}this.syncTimer=setTimeout(()=>{this.syncTimer=null;if(document.visibilityState==='visible')this.autoSync();},2000);}
+ autoSync(){if(!this.data.username||!this.data.password)return;if(this.busy){this.pendingSync=true;return;}this.sync().catch(e=>new Notice('Link sync failed: '+e.message));}
+ finishSync(){this.authContext=null;this.busy=false;if(this.pendingSync){this.pendingSync=false;this.scheduleSync();}}
  endpoint(){const key=this.data.endpoint??'production';if(!Object.prototype.hasOwnProperty.call(ENDPOINTS,key))throw Error('Invalid vault selection');return ENDPOINTS[key];}
  async selectEndpoint(key){if(!Object.prototype.hasOwnProperty.call(ENDPOINTS,key))throw Error('Invalid vault selection');if(key===(this.data.endpoint??'production'))return;if(this.busy||this.data.initialized||this.data.initializing||Object.keys(this.data.base||{}).length||(this.data.conflicts||[]).length||(this.data.conflictArchive||[]).length||Object.keys(this.data.preimages||{}).length)throw Error('Vault already started syncing. Use a separate empty vault.');if(this.data.username||this.data.password)throw Error('Clear credentials before changing the vault connection.');const old=this.data.endpoint;this.busy=true;this.data.endpoint=key;try{await this.saveData(this.data);}catch(e){this.data.endpoint=old;throw e;}finally{this.busy=false;}}
  async call(method,path,body,extra={}){
   if(path && !this.safe(path))throw Error('Unsafe path');
-  const target=this.endpoint()+path.split('/').map(encodeURIComponent).join('/');
+  let target=this.endpoint()+path.split('/').map(encodeURIComponent).join('/');if(method==='GET'){this.readSeq=(this.readSeq||0)+1;target+='?link_sync='+Date.now()+'-'+this.readSeq;}
   const auth=this.authContext||this.data,credentials=btoa(unescape(encodeURIComponent(auth.username+':'+auth.password)));
-  return requestUrl({url:target,method,headers:{Authorization:'Basic '+credentials,...extra},body,throw:false});
+  return requestUrl({url:target,method,headers:{Authorization:'Basic '+credentials,'Cache-Control':'no-cache, no-store','Pragma':'no-cache',...extra},body,throw:false});
  }
  async listRemote(){
   const queue=[''],out=[];
@@ -51,7 +55,7 @@ class LinkSync extends Plugin {
   if(!this.data.conflicts.includes(item)||!this.safe(item.path))throw Error('Conflict is no longer current');
   if(item.local==null||item.remote==null)throw Error('Deletion conflicts require separate review');
   if(baseline(this.data.base,item.path)!==(item.base??null))throw Error('Baseline changed; sync again');
-  this.busy=true;this.authContext={username:this.data.username,password:this.data.password};
+  this.busy=true;this.expectedWrites?.clear();this.authContext={username:this.data.username,password:this.data.password};
   try{
    const local=from64(item.local),remote=from64(item.remote),path=item.path;
    if(!(await this.app.vault.adapter.exists(path)))throw Error('Local file changed; sync again');
@@ -73,30 +77,30 @@ class LinkSync extends Plugin {
    if(await hash(chosen)!==await hash(remote)){
     const r=await this.call('PUT',path,chosen,{'If-Match':etag});if(![200,201,204].includes(r.status))throw Error('Remote resolution not confirmed: '+r.status);
    }
-   if(file)await this.app.vault.process(file,current=>{if(current!==oldText)throw Error('Local file changed; sync again');return newText;});
+   if(file){this.markOwnWrite(path,await hash(chosen));await this.app.vault.process(file,current=>{if(current!==oldText)throw Error('Local file changed; sync again');return newText;});}
    const after=await this.call('GET',path);if(after.status!==200||await hash(after.arrayBuffer)!==await hash(chosen)||await hash(await this.app.vault.adapter.readBinary(path))!==await hash(chosen))throw Error('Outcome changed or uncertain; sync again');
    strongValidator(after.headers,await hash(chosen));
    const previousBase=baseline(this.data.base,path), previousConflicts=this.data.conflicts;
    archiveConflicts(this.data,[item]);setbase(this.data.base,path,await hash(chosen));this.data.conflicts=previousConflicts.filter(c=>c!==item);
    try{await this.saveData(this.data);}catch(e){if(previousBase===null)delete this.data.base[path];else setbase(this.data.base,path,previousBase);this.data.conflicts=previousConflicts;throw e;}
    new Notice('Link conflict applied');
-  }finally{this.authContext=null;this.busy=false;}
+  }finally{this.finishSync();}
  }
 
  async sync(){
-  if(this.busy)throw Error('Already running');if(!this.data.username||!this.data.password)throw Error('Configure credentials on this device');this.busy=true;this.authContext={username:this.data.username,password:this.data.password};
+  if(this.busy)throw Error('Already running');if(!this.data.username||!this.data.password)throw Error('Configure credentials on this device');this.busy=true;this.expectedWrites?.clear();this.authContext={username:this.data.username,password:this.data.password};
   try{const local=new Set(await this.listLocal());
    if(!this.data.initialized&&!this.data.initializing){if(local.size)throw Error('First sync requires an empty vault. Back up and review existing files first.');this.data.initializing=true;try{await this.saveData(this.data);}catch(e){this.data.initializing=false;throw e;}}
    const remote=new Set(await this.listRemote()),all=new Set([...local,...remote,...Object.keys(this.data.base)]),conflicts=[];let count=0;
    for(const path of Array.from(all).sort()){
     if(!this.safe(path))throw Error('Unsafe path');let lb=null,rb=null,lh=null,rh=null,etag=null;
     if(local.has(path)){lb=await this.app.vault.adapter.readBinary(path);lh=await hash(lb);}
-    if(remote.has(path)){const r=await this.call('GET',path);if(r.status!==200)throw Error('Remote read '+r.status);rb=r.arrayBuffer;rh=await hash(rb);etag=strongValidator(r.headers,rh);}
+    if(remote.has(path)){const r=await this.call('GET',path);if(r.status===304)throw Error('Server returned a cached response; retry sync');if(r.status!==200)throw Error('Remote read '+r.status);rb=r.arrayBuffer;rh=await hash(rb);etag=strongValidator(r.headers,rh);}
     const prior=baseline(this.data.base,path);let action=plan(prior,lh,rh);if(!this.data.initialized&&action==='upload')action='conflict';
     if(action==='equal'){if(lh===null)delete this.data.base[path];else setbase(this.data.base,path,lh);continue;}
     if(action==='download-new'){
      await this.ensureLocalParents(path);
-     try{await this.app.vault.createBinary(path,rb);}catch(e){
+     this.markOwnWrite(path,rh);try{await this.app.vault.createBinary(path,rb);}catch(e){
       if(!(await this.app.vault.adapter.exists(path)))throw e;
       conflicts.push({path,base:prior,reason:'Local file appeared',local:to64(await this.app.vault.adapter.readBinary(path)),remote:to64(rb)});continue;
      }
@@ -108,7 +112,7 @@ class LinkSync extends Plugin {
      }catch{conflicts.push({path,base:prior,reason:'Cannot safely update non-text data',local:to64(lb),remote:to64(rb)});continue;}
      const file=this.app.vault.getFileByPath(path);if(!file){conflicts.push({path,base:prior,reason:'Local file unavailable',local:to64(lb),remote:to64(rb)});continue;}
      this.data.preimages=this.data.preimages||{};this.data.preimages[lh]=to64(lb);await this.saveData(this.data);
-     try{await this.app.vault.process(file,current=>{if(current!==oldText)throw Error('Local note changed');return newText;});}
+     this.markOwnWrite(path,rh);try{await this.app.vault.process(file,current=>{if(current!==oldText)throw Error('Local note changed');return newText;});}
      catch{conflicts.push({path,base:prior,reason:'Local note changed during update',local:to64(lb),remote:to64(rb)});continue;}
      setbase(this.data.base,path,rh);count++;continue;
     }
@@ -120,7 +124,7 @@ class LinkSync extends Plugin {
     conflicts.push({path,base:prior,reason:'Both changed, remote changed, or deletion',local:lb===null?null:to64(lb),remote:rb===null?null:to64(rb)});
    }
    const oldConflicts=this.data.conflicts||[];archiveConflicts(this.data,oldConflicts);this.data.conflicts=conflicts;const finishing=!this.data.initialized&&conflicts.length===0;if(finishing){this.data.initialized=true;this.data.initializing=false;}try{await this.saveData(this.data);}catch(e){this.data.conflicts=oldConflicts;if(finishing){this.data.initialized=false;this.data.initializing=true;}throw e;}new Notice('Link: '+count+' changed; '+conflicts.length+' need review');
-  }finally{this.authContext=null;this.busy=false;}
+  }finally{this.finishSync();}
  }
 }
 class LinkSettings extends PluginSettingTab{
@@ -130,7 +134,7 @@ class LinkSettings extends PluginSettingTab{
   new Setting(el).setName('Username').addText(t=>t.setValue(this.plugin.data.username).onChange(async v=>{this.plugin.data.username=v;await this.plugin.saveData(this.plugin.data);}));
   new Setting(el).setName('Password').setDesc('Stored on this device in the plugin settings.').addText(t=>{t.inputEl.type='password';t.setValue(this.plugin.data.password).onChange(async v=>{this.plugin.data.password=v;await this.plugin.saveData(this.plugin.data);});});
   new Setting(el).setName('Sync now').addButton(b=>b.setButtonText('Sync').onClick(()=>this.plugin.sync().then(()=>this.display()).catch(e=>new Notice('Link sync failed: '+e.message))));
-  el.createEl('p',{text:'Sync runs when Obsidian opens or returns to the foreground, and can be started manually. The first sync requires an empty vault. Unchanged notes may be updated from the server; conflicting edits require review. Deletions are not propagated.'});
+  el.createEl('p',{text:'Sync runs after saved edits, on opening or returning to Obsidian, and manually. The first sync requires an empty vault. Unchanged notes may be updated from the server; conflicting edits require review. Deletions are not propagated.'});
   for(const c of this.plugin.data.conflicts||[])new Setting(el).setName(c.path).setDesc(c.reason).addButton(b=>b.setButtonText('Review').onClick(()=>new ConflictView(this.app,c,this.plugin).open()));
   for(const c of this.plugin.data.conflictArchive||[])new Setting(el).setName(c.path).setDesc('Archived '+(c.archivedAt||'time unknown')).addButton(b=>b.setButtonText('View history').onClick(()=>new ConflictHistory(this.app,c).open()));
  }
