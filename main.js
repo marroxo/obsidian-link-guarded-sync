@@ -774,6 +774,7 @@ const API = 'https://link.andric.studio/library';
 const MAX_SMALL = 1024 * 1024;
 const MAX_RUN_FILE = 8 * 1024 * 1024;
 const MAX_RUN_TRANSFERS = 20;
+const BATCH_COOLDOWN_MS = 1000;
 const validPart = x => !!x && x !== '.' && x !== '..' && !/[\\:<>\x00-\u001f"|?*]/.test(x) && !/[. ]$/.test(x) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(x);
 function workspacePath(rel) {
   if (typeof rel !== 'string' || !rel.startsWith(ROOT + '/') || !rel.split('/').every(validPart)) throw Error('Unsafe catalog path');
@@ -836,6 +837,19 @@ class WorkspaceImporter {
     return Number.isFinite(st.mtime)&&st.mtime===receipt.mtime&&(receipt.ctime==null||st.ctime===receipt.ctime);
   }
   async checkRoot(){await verifyVaultRoot(this.vault);}
+  async waitForNextBatch(signal,generation,index,total){
+    if(signal?.aborted)throw Error('Transfer paused');
+    this.progress?.({index,total,status:'Waiting before next batch'});
+    await new Promise((resolve,reject)=>{
+      let timer;const aborted=()=>{clearTimeout(timer);signal?.removeEventListener('abort',aborted);reject(Error('Transfer paused'));};
+      timer=setTimeout(()=>{signal?.removeEventListener('abort',aborted);resolve();},BATCH_COOLDOWN_MS);
+      signal?.addEventListener('abort',aborted,{once:true});
+      if(signal?.aborted)aborted();
+    });
+    if(signal?.aborted)throw Error('Transfer paused');
+    if(await this.probe()!==generation)throw Error('Workspace generation changed; restart required');
+    if(signal?.aborted)throw Error('Transfer paused');
+  }
   async run(signal,{force=false}={}) {
     if (this.running) throw Error('Workspace import already running');
     if (!this.data.workspaceReserved) throw Error('Workspace import is not enabled');
@@ -859,7 +873,7 @@ class WorkspaceImporter {
       const legacy=this.data.workspaceReceipts||{};
       if (typeof legacy !== 'object' || Array.isArray(legacy)) throw Error('Invalid workspace receipts');
       const store=createReceiptStore({adapter,crypto:this.crypto});
-      let installed=0,updated=0,removed=0,review=0,previouslyDownloaded=0,reviewPaths=[],reviewReasons={},pendingMissing=[],caseBlocked=new Set(),deletionPlans=[];
+      let installed=0,updated=0,removed=0,review=0,previouslyDownloaded=0,reviewPaths=[],reviewReasons={},pendingMissing=[],caseBlocked=new Set(),deletionPlans=[],batchOps=0;
       const flag=(path,reason)=>{review++;reviewPaths.push(path);reviewReasons[path]=reason;};
       // Absence has meaning only when both catalog generations are complete.
       if(previous){
@@ -884,7 +898,8 @@ class WorkspaceImporter {
         }
         for(const {old,state,receipt} of deletionPlans){
           if(signal?.aborted)throw Error('Transfer paused');
-          if(removed>=MAX_RUN_TRANSFERS)return {installed,updated,removed,review,reviewPaths,reviewReasons,previouslyDownloaded,total:assets.length,batchPaused:true};
+          if(batchOps>=MAX_RUN_TRANSFERS){await this.waitForNextBatch(signal,generation,0,assets.length);batchOps=0;}
+          batchOps++;
           await this.diagnostic?.({path:old.path,phase:'retain',bytes:0,total:receipt.size});
           await this.checkRoot();
           const archive='.obsidian/plugins/link-guarded-sync/workspace-archive/'+store.random()+'/content';await this.parents(archive);
@@ -927,7 +942,8 @@ class WorkspaceImporter {
           if(receipt.size>MAX_SMALL)this.progress?.({index:i+1,total:assets.length,path:a.path,installed,review,status:'Large file checked by metadata; local contents not rehashed'});
         }else if(receipt&&receipt.status!=='removed'){flag(a.path,'Previously downloaded file is missing');continue;}
         if(a.size>MAX_RUN_FILE){flag(a.path,'Large file deferred for review');continue;}
-        if(installed+updated+removed>=MAX_RUN_TRANSFERS)return {installed,updated,removed,review,reviewPaths,reviewReasons,previouslyDownloaded,total:assets.length,batchPaused:true};
+        if(batchOps>=MAX_RUN_TRANSFERS){await this.waitForNextBatch(signal,generation,i+1,assets.length);batchOps=0;}
+        batchOps++;
         await this.diagnostic?.({path:a.path,phase:'download',bytes:0,total:a.size});
         await cache.download(a.sha,a.size,signal,(chunk,total)=>this.progress?.({index:i+1,total:assets.length,path:a.path,chunk,chunks:total,installed,review}),async bytes=>{await this.diagnostic?.({path:a.path,phase:'download',bytes,total:a.size});});
         await this.diagnostic?.({path:a.path,phase:'verify',bytes:a.size,total:a.size});
@@ -964,6 +980,9 @@ class WorkspaceImporter {
         await store.finish(a.path,state.dir,journal);
         if(exists)updated++;else installed++;
       }
+      if(signal?.aborted)throw Error('Transfer paused');
+      if(await this.probe()!==generation)throw Error('Workspace generation changed; restart required');
+      if(signal?.aborted)throw Error('Transfer paused');
       const newCheckpoint=await checkpoint.save(generation,assets,pendingMissing);
       const before={generation:this.data.workspaceGeneration,checkpoint:this.data.workspaceCatalogReceipt,paths:this.data.workspaceReviewPaths,reasons:this.data.workspaceReviewReasons};
       this.data.workspaceGeneration=generation;this.data.workspaceCatalogReceipt=newCheckpoint;this.data.workspaceReviewPaths=reviewPaths;this.data.workspaceReviewReasons=reviewReasons;
@@ -1196,9 +1215,8 @@ class LinkSync extends Plugin {
     this.workspaceAbort=null;runStarted=true;const result=await this.importWorkspace(p=>this.workspaceReport(`${p.index}/${p.total} ${p.status||''}`));
     this.workspaceReviewPaths=result.reviewPaths;
     this.workspaceReviewReasons=result.reviewReasons||{};
-    if(result.batchPaused){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;await this.saveData(this.data);}
-    else if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
-    this.workspaceReport(result.batchPaused?`Paused after ${result.installed+result.updated} transfers; resume for next batch`:result.unchanged?`Up to date; ${result.review} need review`:`${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
+    if(this.data.workspacePending){this.data.workspacePending=false;await this.saveData(this.data);}
+    this.workspaceReport(result.unchanged?`Workspace checked; ${result.review} need review`:`${result.installed} added, ${result.updated} updated, ${result.removed} removed (retained), ${result.previouslyDownloaded} previously downloaded (not rehashed), ${result.review} need review`);
    }catch(e){
     interrupted=runStarted&&!!this.workspaceAbort?.signal.aborted;
     if(!interrupted){this.data.workspacePending=false;this.data.workspaceAutoEnabled=false;try{await this.saveData(this.data);}catch{}this.workspaceReport(e.message);}
