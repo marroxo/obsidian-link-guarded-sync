@@ -146,15 +146,15 @@ class ConflictHistory extends Modal{
 }
 class ConflictView extends Modal{
  constructor(app,item,plugin){super(app);this.item={...item};this.plugin=plugin;}
- onOpen(){const el=this.contentEl;el.createEl('h2',{text:this.item.path});for(const side of ['local','remote']){el.createEl('h3',{text:side});const value=this.item[side];let text='Unavailable';if(value!=null){try{text=new TextDecoder('utf-8',{fatal:true}).decode(from64(value));}catch{text='Binary content; inspect the saved copy on this device.';}}const pre=el.createEl('pre');pre.textContent=text;}
-  if(this.item.local==null||this.item.remote==null){el.createEl('p',{text:'Deletion conflicts require separate review; both sides are preserved.'});return;}
+ onOpen(){const el=this.contentEl;this.modalEl.classList.add('link-conflict-modal');const updateViewport=()=>{const viewport=window.visualViewport;this.modalEl.style.setProperty('--link-visible-height',Math.max(1,(viewport?.height??window.innerHeight)-16)+'px');this.modalEl.style.setProperty('--link-visible-top',Math.max(0,viewport?.offsetTop??0)+8+'px');};this.viewportUpdate=updateViewport;window.addEventListener('resize',updateViewport);window.visualViewport?.addEventListener('resize',updateViewport);window.visualViewport?.addEventListener('scroll',updateViewport);updateViewport();const body=el.createDiv({cls:'link-conflict-body'});body.createEl('h2',{text:this.item.path});for(const side of ['local','remote']){body.createEl('h3',{text:side});const value=this.item[side];let text='Unavailable';if(value!=null){try{text=new TextDecoder('utf-8',{fatal:true}).decode(from64(value));}catch{text='Binary content; inspect the saved copy on this device.';}}const pre=body.createEl('pre');pre.textContent=text;}
+  if(this.item.local==null||this.item.remote==null){body.createEl('p',{text:'Deletion conflicts require separate review; both sides are preserved.'});return;}
   const apply=(choice,text)=>this.plugin.resolve(this.item,choice,text).then(()=>this.close()).catch(e=>new Notice('Link: '+e.message));
-  new Setting(el).setName('Use local version').addButton(b=>b.setButtonText('Use local').onClick(()=>apply('local')));
-  new Setting(el).setName('Use remote version').addButton(b=>b.setButtonText('Use remote').onClick(()=>apply('remote')));
+  new Setting(body).setName('Use local version').addButton(b=>b.setButtonText('Use local').onClick(()=>apply('local')));
+  new Setting(body).setName('Use remote version').addButton(b=>b.setButtonText('Use remote').onClick(()=>apply('remote')));
   let merged;try{merged=new TextDecoder('utf-8',{fatal:true}).decode(from64(this.item.local));}catch{}
-  if(merged!==undefined){new Setting(el).setName('Merged text').addTextArea(t=>t.setValue(merged).onChange(v=>{merged=v;}));
-   new Setting(el).setName('Apply merged text').addButton(b=>b.setButtonText('Apply merged').onClick(()=>apply('merged',merged)));}
+  if(merged!==undefined){let textarea;new Setting(body).setName('Merged text').addTextArea(t=>{textarea=t.inputEl;textarea.classList.add('link-conflict-textarea');t.setValue(merged).onChange(v=>{merged=v;});});
+   const footer=el.createDiv({cls:'link-conflict-footer'});const done=footer.createEl('button',{text:'Hide keyboard'});done.addEventListener('click',()=>textarea.blur());const submit=footer.createEl('button',{text:'Apply merged',cls:'mod-cta'});submit.addEventListener('click',()=>apply('merged',merged));}
  }
- onClose(){this.contentEl.empty();}
+ onClose(){window.removeEventListener('resize',this.viewportUpdate);window.visualViewport?.removeEventListener('resize',this.viewportUpdate);window.visualViewport?.removeEventListener('scroll',this.viewportUpdate);this.modalEl.classList.remove('link-conflict-modal');this.modalEl.style.removeProperty('--link-visible-height');this.modalEl.style.removeProperty('--link-visible-top');this.contentEl.empty();}
 }
 module.exports=LinkSync;module.exports._test={valid,plan,strongValidator};
