@@ -1,5 +1,5 @@
 const {Plugin,PluginSettingTab,Setting,Notice,Modal,requestUrl}=require('obsidian');
-const BASE='https://obsidian.markojelly.lol/link/Link/';
+const ENDPOINTS={production:'https://obsidian.markojelly.lol/link/Link/',test:'https://obsidian.markojelly.lol/link-mobile-test/Link/'};
 const encoder=new TextEncoder();
 const hex=b=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');
 async function hash(b){return hex(await crypto.subtle.digest('SHA-256',b));}
@@ -18,11 +18,14 @@ function setbase(base,path,value){Object.defineProperty(base,path,{value,writabl
 function archiveConflicts(data,items){const archive=data.conflictArchive||[],keyOf=c=>JSON.stringify([c.path,c.base,c.reason,c.local,c.remote]),known=new Set(archive.map(keyOf));for(const c of items){const key=keyOf(c);if(!known.has(key)){archive.push({...c,archivedAt:new Date().toISOString()});known.add(key);}}data.conflictArchive=archive;}
 class LinkSync extends Plugin {
  safe(path){const config=(this.app.vault.configDir||'.obsidian').toLowerCase();return valid(path)&&!path.split('/').some(x=>x.toLowerCase()===config);}
- async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[]},await this.loadData());this.busy=false;this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});}
+ async onload(){this.data=Object.assign({username:'',password:'',base:{},conflicts:[],endpoint:'production'},await this.loadData());this.busy=false;this.addSettingTab(new LinkSettings(this.app,this));this.addCommand({id:'sync',name:'Sync Link vault',callback:()=>this.sync().catch(e=>new Notice('Link sync failed: '+e.message))});let active=true;this.register(()=>{active=false;});const resume=()=>{if(active&&document.visibilityState==='visible')this.autoSync();};this.registerDomEvent(document,'visibilitychange',resume);this.app.workspace.onLayoutReady(resume);}
+ autoSync(){if(this.busy||!this.data.username||!this.data.password)return;this.sync().catch(e=>new Notice('Link sync failed: '+e.message));}
+ endpoint(){const key=this.data.endpoint??'production';if(!Object.prototype.hasOwnProperty.call(ENDPOINTS,key))throw Error('Invalid vault selection');return ENDPOINTS[key];}
+ async selectEndpoint(key){if(!Object.prototype.hasOwnProperty.call(ENDPOINTS,key))throw Error('Invalid vault selection');if(key===(this.data.endpoint??'production'))return;if(this.busy||this.data.initialized||this.data.initializing||Object.keys(this.data.base||{}).length||(this.data.conflicts||[]).length||(this.data.conflictArchive||[]).length||Object.keys(this.data.preimages||{}).length)throw Error('Vault already started syncing. Use a separate empty vault.');if(this.data.username||this.data.password)throw Error('Clear credentials before changing the vault connection.');const old=this.data.endpoint;this.busy=true;this.data.endpoint=key;try{await this.saveData(this.data);}catch(e){this.data.endpoint=old;throw e;}finally{this.busy=false;}}
  async call(method,path,body,extra={}){
   if(path && !this.safe(path))throw Error('Unsafe path');
-  const target=BASE+path.split('/').map(encodeURIComponent).join('/');
-  const credentials=btoa(unescape(encodeURIComponent(this.data.username+':'+this.data.password)));
+  const target=this.endpoint()+path.split('/').map(encodeURIComponent).join('/');
+  const auth=this.authContext||this.data,credentials=btoa(unescape(encodeURIComponent(auth.username+':'+auth.password)));
   return requestUrl({url:target,method,headers:{Authorization:'Basic '+credentials,...extra},body,throw:false});
  }
  async listRemote(){
@@ -31,7 +34,7 @@ class LinkSync extends Plugin {
    const xml=new DOMParser().parseFromString(r.text,'application/xml');if(xml.querySelector('parsererror'))throw Error('Invalid remote listing');
    for(const node of Array.from(xml.getElementsByTagNameNS('DAV:','response'))){
     const href=node.getElementsByTagNameNS('DAV:','href')[0]?.textContent;if(!href)throw Error('Invalid href');
-    const u=new URL(href,BASE),root=new URL(BASE);if(u.origin!==root.origin||!u.pathname.startsWith(root.pathname))throw Error('Unexpected remote href');
+    const root=new URL(this.endpoint()),u=new URL(href,root);if(u.origin!==root.origin||!u.pathname.startsWith(root.pathname))throw Error('Unexpected remote href');
     const path=decodeURIComponent(u.pathname.slice(root.pathname.length)).replace(/\/$/,'');if(!path||path===parent)continue;if(!this.safe(path))throw Error('Unsafe remote name');
     if(node.getElementsByTagNameNS('DAV:','collection').length)queue.push(path);else out.push(path);
    }
@@ -46,7 +49,7 @@ class LinkSync extends Plugin {
   if(!this.data.conflicts.includes(item)||!this.safe(item.path))throw Error('Conflict is no longer current');
   if(item.local==null||item.remote==null)throw Error('Deletion conflicts require separate review');
   if(baseline(this.data.base,item.path)!==(item.base??null))throw Error('Baseline changed; sync again');
-  this.busy=true;
+  this.busy=true;this.authContext={username:this.data.username,password:this.data.password};
   try{
    const local=from64(item.local),remote=from64(item.remote),path=item.path;
    if(!(await this.app.vault.adapter.exists(path)))throw Error('Local file changed; sync again');
@@ -75,11 +78,11 @@ class LinkSync extends Plugin {
    archiveConflicts(this.data,[item]);setbase(this.data.base,path,await hash(chosen));this.data.conflicts=previousConflicts.filter(c=>c!==item);
    try{await this.saveData(this.data);}catch(e){if(previousBase===null)delete this.data.base[path];else setbase(this.data.base,path,previousBase);this.data.conflicts=previousConflicts;throw e;}
    new Notice('Link conflict applied');
-  }finally{this.busy=false;}
+  }finally{this.authContext=null;this.busy=false;}
  }
 
  async sync(){
-  if(this.busy)throw Error('Already running');if(!this.data.username||!this.data.password)throw Error('Configure credentials on this device');this.busy=true;
+  if(this.busy)throw Error('Already running');if(!this.data.username||!this.data.password)throw Error('Configure credentials on this device');this.busy=true;this.authContext={username:this.data.username,password:this.data.password};
   try{const local=new Set(await this.listLocal());
    if(!this.data.initialized&&!this.data.initializing){if(local.size)throw Error('First sync requires an empty vault. Back up and review existing files first.');this.data.initializing=true;try{await this.saveData(this.data);}catch(e){this.data.initializing=false;throw e;}}
    const remote=new Set(await this.listRemote()),all=new Set([...local,...remote,...Object.keys(this.data.base)]),conflicts=[];let count=0;
@@ -115,16 +118,17 @@ class LinkSync extends Plugin {
     conflicts.push({path,base:prior,reason:'Both changed, remote changed, or deletion',local:lb===null?null:to64(lb),remote:rb===null?null:to64(rb)});
    }
    const oldConflicts=this.data.conflicts||[];archiveConflicts(this.data,oldConflicts);this.data.conflicts=conflicts;const finishing=!this.data.initialized&&conflicts.length===0;if(finishing){this.data.initialized=true;this.data.initializing=false;}try{await this.saveData(this.data);}catch(e){this.data.conflicts=oldConflicts;if(finishing){this.data.initialized=false;this.data.initializing=true;}throw e;}new Notice('Link: '+count+' changed; '+conflicts.length+' need review');
-  }finally{this.busy=false;}
+  }finally{this.authContext=null;this.busy=false;}
  }
 }
 class LinkSettings extends PluginSettingTab{
  constructor(app,plugin){super(app,plugin);this.plugin=plugin;}
  display(){const el=this.containerEl;el.empty();el.createEl('h2',{text:'Link guarded sync'});
+  new Setting(el).setName('Vault connection').setDesc('Choose before the first sync. Use a separate empty vault for testing.').addDropdown(d=>d.addOption('production','Link production vault').addOption('test','Isolated test vault').setValue(this.plugin.data.endpoint??'production').onChange(v=>this.plugin.selectEndpoint(v).then(()=>this.display()).catch(e=>{new Notice(e.message);this.display();})));
   new Setting(el).setName('Username').addText(t=>t.setValue(this.plugin.data.username).onChange(async v=>{this.plugin.data.username=v;await this.plugin.saveData(this.plugin.data);}));
   new Setting(el).setName('Password').setDesc('Stored on this device in the plugin settings.').addText(t=>{t.inputEl.type='password';t.setValue(this.plugin.data.password).onChange(async v=>{this.plugin.data.password=v;await this.plugin.saveData(this.plugin.data);});});
   new Setting(el).setName('Sync now').addButton(b=>b.setButtonText('Sync').onClick(()=>this.plugin.sync().then(()=>this.display()).catch(e=>new Notice('Link sync failed: '+e.message))));
-  el.createEl('p',{text:'Sync is manual. The first sync requires an empty vault. Unchanged notes may be updated from the server; conflicting edits require review. Deletions are not propagated.'});
+  el.createEl('p',{text:'Sync runs when Obsidian opens or returns to the foreground, and can be started manually. The first sync requires an empty vault. Unchanged notes may be updated from the server; conflicting edits require review. Deletions are not propagated.'});
   for(const c of this.plugin.data.conflicts||[])new Setting(el).setName(c.path).setDesc(c.reason).addButton(b=>b.setButtonText('Review').onClick(()=>new ConflictView(this.app,c,this.plugin).open()));
   for(const c of this.plugin.data.conflictArchive||[])new Setting(el).setName(c.path).setDesc('Archived '+(c.archivedAt||'time unknown')).addButton(b=>b.setButtonText('View history').onClick(()=>new ConflictHistory(this.app,c).open()));
  }
